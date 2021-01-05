@@ -1,3 +1,5 @@
+module Main where
+
 import Utils
 import qualified Trie
 import CabalSupport(parseCabalFile,Unit(..))
@@ -7,11 +9,13 @@ import Control.Monad(when,forM_,msum,guard,unless)
 import Control.Monad.Fix(mfix)
 import           Control.Exception (SomeException(..))
 import qualified Control.Exception as X (catch)
-import Data.List(intersperse,transpose)
+import Data.Bifunctor(second)
+import Data.List(intersperse,transpose,foldl',intercalate,sortBy,maximumBy)
 import Data.Maybe(isJust,fromMaybe,listToMaybe)
 import qualified Data.IntMap as IMap
 import qualified Data.Map    as Map
 import qualified Data.IntSet as ISet
+import Data.Ord(comparing)
 import System.Environment(getArgs)
 import System.IO(hPutStrLn,stderr)
 import System.FilePath
@@ -33,7 +37,10 @@ main = do xs <- getArgs
                   do (incs,inps) <- fromCabal (use_cabal opts)
                      g <- graph (foldr add_inc (add_current opts) incs)
                                 (inps ++ map to_input ms)
-                     putStr (make_dot opts g)
+                     putStr $
+                       if render_dag opts
+                         then make_dag opts g
+                         else make_dot opts g
               where opts = foldr ($) default_opts fs
 
             _ -> hPutStrLn stderr $
@@ -205,7 +212,7 @@ isIgnored (Trie.Sub ts i              ) (q,m) =
     x : xs ->
       case Map.lookup x ts of
         Nothing -> False
-        Just t -> isIgnored t (fromHierarchy xs,m) 
+        Just t -> isIgnored t (fromHierarchy xs,m)
 
 
 -- XXX: We could combine collapseAll and collapse into a single pass
@@ -478,6 +485,7 @@ data Opts = Opts
   { inc_dirs      :: [FilePath]
   , quiet         :: Bool
   , with_missing  :: Bool
+  , render_dag    :: Bool
   , use_clusters  :: Bool
   , mod_in_cluster:: Bool
   , ignore_mods   :: IgnoreSet
@@ -503,6 +511,7 @@ default_opts = Opts
   { inc_dirs        = []
   , quiet           = False
   , with_missing    = False
+  , render_dag      = False
   , use_clusters    = True
   , mod_in_cluster  = True
   , ignore_mods     = Trie.empty
@@ -524,6 +533,9 @@ options =
 
   , Option ['a'] ["all"]   (NoArg set_all)
     "Add nodes for missing modules"
+
+  , Option []    ["render-dag"] (NoArg set_render_dag)
+    "Render DAG directly instead of outputting dot"
 
   , Option []    ["no-cluster"] (NoArg set_no_cluster)
     "Do not cluster directories"
@@ -573,6 +585,9 @@ set_show_version o = o { show_version = True }
 set_all          :: OptT
 set_all o         = o { with_missing = True }
 
+set_render_dag   :: OptT
+set_render_dag o  = o { render_dag = True }
+
 set_no_cluster   :: OptT
 set_no_cluster o  = o { use_clusters = False }
 
@@ -620,3 +635,322 @@ set_size s o = o { graph_size = s }
 set_cabal :: Bool -> OptT
 set_cabal on o = o { use_cabal = on }
 
+-- Render DAG
+--------------------------------------------------------------------------------
+
+type DAG = IMap.IntMap Node
+data Node = Node {
+      nodeLabel  :: String
+    , nodeX      :: Int
+    , nodeY      :: Int
+    , nodeHeight :: Int
+    , nodeWidth  :: Int
+    }
+
+make_dag :: Opts -> (AllEdges, Nodes) -> String
+make_dag _opts = \(edges, nodes) ->
+    if not (IMap.null (sourceEdges edges))
+      then error "Not, in fact, a tree"
+      else let nodes'     = invertTrie [] nodes
+               imports    = normalEdges edges
+               revImports = invertEdges imports
+           in   html
+              . genJS imports revImports
+              . mkDAG nodes' imports
+              $ layers imports ISet.empty (IMap.keysSet nodes')
+  where
+    html :: String -> String
+    html script = intercalate "\n" [
+          "<!DOCTYPE html>"
+        , "<html>"
+        , " <head>"
+        , "  <meta charset=\"utf-8\"/>"
+        , "  <script type=\"application/javascript\">"
+        , script
+        , "  </script>"
+        , " </head>"
+        , " <body onload=\"init();\">"
+        , "   <canvas id=\"canvas\" width=\"20000\" height=\"5000\"></canvas>"
+        , " </body>"
+        , "</html>"
+        ]
+
+    paddingX, paddingY :: Int
+    paddingX = 30;
+    paddingY = 50;
+
+    charHeight, charWidth :: Int
+    charHeight = 15
+    charWidth  = 10;
+
+    initX, initY :: Int
+    initX = 10;
+    initY = 10;
+
+    genJS :: Edges -> Edges -> DAG -> String
+    genJS imports revImports dag = intercalate "\n" [
+          statistics
+        , "function init() {"
+        , "  var canvas = document.getElementById('canvas');"
+        , "  canvas.onclick = canvasClicked;"
+        , ""
+        , "  draw();"
+        , "}"
+        , ""
+        , "function draw() {"
+        , "  var canvas = document.getElementById('canvas');"
+        , "  if (canvas.getContext) {"
+        , "    var ctx = canvas.getContext('2d');"
+        , "    ctx.font = '12px sans-serif';"
+        , "    ctx.clearRect(0, 0, 20000, 5000);"
+        , "    for(var i in allNodes) {"
+        , "      drawImports(ctx, parseInt(i));"
+        , "    }"
+        , "    for(var i in allNodes) {"
+        , "      drawNode(ctx, parseInt(i));"
+        , "    }"
+        , "  }"
+        , "}"
+        , ""
+        , "function canvasClicked(e) {"
+        , "  var canvas = document.getElementById('canvas');"
+        , "  var rect   = canvas.getBoundingClientRect();"
+        , "  var x      = event.clientX - rect.left;"
+        , "  var y      = event.clientY - rect.top;"
+        , "  for(var i in allNodes) {"
+        , "    var n = allNodes[i];"
+        , "    if(x >= n.x && x <= (n.x + n.width) &&"
+        , "       y >= n.y && y <= (n.y + n.height)) {"
+        , "      console.log('Clicked on ', n.label);"
+        , "      selectedNode = n;"
+        , "      draw();"
+        , "    }"
+        , "  }"
+        , "}"
+        , ""
+        , "function drawNode(ctx, i) {"
+        , "  var n = allNodes[i];"
+        , "  if(n == selectedNode) {"
+        , "    ctx.fillStyle = '#ffaaaab0';"
+        , "  } else if (selectedNode != null && selectedNode.transImports.includes(i)) {"
+        , "    ctx.fillStyle = '#aaffaab0';"
+        , "  } else if (selectedNode != null && selectedNode.transRevImports.includes(i)) {"
+        , "    ctx.fillStyle = '#aaaaffb0';"
+        , "  } else {"
+        , "    ctx.fillStyle = '#ffffffb0';"
+        , "  }"
+        , "  ctx.fillRect(n.x - 2, n.y - 2, n.width + 4, n.height + 4);"
+        , "  ctx.strokeStyle = '#000000';"
+        , "  ctx.strokeRect(n.x - 2, n.y - 2, n.width + 4, n.height + 4);"
+        , "  ctx.fillStyle = '#000000';"
+        , "  ctx.fillText(n.label, n.x, n.y + n.height, n.width);"
+        , "}"
+        , ""
+        , "function drawImports(ctx, i) {"
+        , "  var n       = allNodes[i];"
+        , "  var n_north = {x: n.x + n.width / 2, y: n.y};"
+        , "  for(var j in n.imports) {"
+        , "    var m       = allNodes[n.imports[j]];"
+        , "    var m_south = {x: m.x + m.width / 2, y: m.y + m.height};"
+        , "    ctx.beginPath();"
+        , "    ctx.moveTo(n_north.x, n_north.y - 2);"
+        , "    ctx.lineTo(m_south.x, m_south.y + 2);"
+        , "    ctx.strokeStyle = '#00000020';"
+        , "    ctx.stroke();"
+        , "  }"
+        , "}"
+        , ""
+        , "selectedNode = null;"
+        , "allNodes = [];"
+        , intercalate "\n" $ map declareNode (IMap.toList dag)
+        ]
+      where
+        declareNode :: (Int, Node) -> String
+        declareNode (i, n) = intercalate "\n" [
+              "allNodes[" ++ show i ++ "] = {"
+            , "  label: '"   ++ nodeLabel n ++ "'"
+            , ", x: "        ++ show (nodeX n)
+            , ", y: "        ++ show (nodeY n)
+            , ", height: "   ++ show (nodeHeight n)
+            , ", width: "    ++ show (nodeWidth n)
+            , concat [
+                  ", imports: ["
+                , intercalate ", " . map show $
+                    ISet.toList (IMap.findWithDefault ISet.empty i imports)
+                , "]"
+                ]
+            , concat [
+                  ", transImports: ["
+                , intercalate ", " . map show $
+                    ISet.toList (transDeps imports i)
+                , "]"
+                ]
+            , concat [
+                  ", transRevImports: ["
+                , intercalate ", " . map show $
+                    ISet.toList (transDeps revImports i)
+                , "]"
+                ]
+            , "};"
+            ]
+
+        transDeps :: Edges -> Int -> ISet.IntSet
+        transDeps deps = \i ->
+            -- Transitive dependencies technically include the node itself
+            -- as well, but we want to exclude that
+            ISet.delete i $ go ISet.empty [i]
+          where
+            go :: ISet.IntSet -> [Int] -> ISet.IntSet
+            go acc []               = acc
+            go acc (i:is)
+              | i `ISet.member` acc = go acc is
+              | otherwise           = go (ISet.insert i acc) (is ++ directDeps)
+              where
+                directDeps :: [Int]
+                directDeps = ISet.toList $
+                               IMap.findWithDefault ISet.empty i deps
+
+        statistics :: String
+        statistics = concat [
+              "// "
+            , "Maximum width: "
+            ,   show
+              $ (\n -> nodeX n + nodeWidth n)
+              $ maximumBy (comparing nodeX) $ IMap.elems dag
+            , "; "
+            , "Maximum height: "
+            ,   show
+              $ (\n -> nodeY n + nodeHeight n)
+              $ maximumBy (comparing nodeY) $ IMap.elems dag
+            ]
+
+    -- Divide the modules in layers: a module is in layer @n@ if all its
+    -- imports are in some layer @m@, where @m < n@
+    layers :: Edges -> ISet.IntSet -> ISet.IntSet -> [ISet.IntSet]
+    layers imports = go
+      where
+        go :: ISet.IntSet -> ISet.IntSet -> [ISet.IntSet]
+        go done todo
+          | ISet.null todo = []
+          | otherwise      = thisLayer : go (done `ISet.union` thisLayer)
+                                            (todo  ISet.\\     thisLayer)
+          where
+            -- Modules whose imports we have already dealt with
+            thisLayer :: ISet.IntSet
+            thisLayer = ISet.filter importsProcessed todo
+
+            importsProcessed :: Int -> Bool
+            importsProcessed i =
+                ISet.null
+                  ((IMap.findWithDefault ISet.empty i imports) ISet.\\ done)
+
+
+    average :: [Int] -> Int
+    average xs = sum xs `div` length xs
+
+    mkDAG :: IMap.IntMap String -> Edges -> [ISet.IntSet] -> DAG
+    mkDAG nodes imports =
+        go IMap.empty . zip [initY + charHeight, initY + 2 * charHeight + paddingY ..]
+     where
+       go :: DAG -> [(Int, ISet.IntSet)] -> DAG
+       go acc []                = acc
+       go acc ((y, layer):rest) =
+          let idealLayer :: [(Int, Node)]
+              idealLayer = map (\i -> (i, initLayout i)) (ISet.toList layer)
+
+              laidOut :: [(Int, Node)]
+              laidOut = removeOverlap initX $
+                          sortBy (comparing (nodeX . snd)) idealLayer
+          in go (IMap.union acc (IMap.fromList laidOut)) rest
+         where
+           -- Ideally, every module is in the middle of their imports
+           -- We use this as a starting point, and then remove overlap
+           initLayout :: ISet.Key -> Node
+           initLayout i = Node {
+                 nodeLabel  = label
+               , nodeX      = idealX i
+               , nodeY      = y
+               , nodeHeight = charHeight
+               , nodeWidth  = charWidth * length label
+               }
+             where
+               label :: String
+               label = IMap.findWithDefault
+                         (error $ "initialDAG: Unknown node " ++ show i)
+                         i
+                         nodes
+
+           idealX :: ISet.Key -> Int
+           idealX i =
+                 (\is -> if null is
+                           then 0
+                           else average (map (\i' -> nodeX (prevNode i')) is))
+               . ISet.toList
+               $ IMap.findWithDefault ISet.empty i imports
+
+           -- Remove overlap between nodes
+           -- Assumes nodes are ordered by X position
+           removeOverlap :: Int -> [(Int, Node)] -> [(Int, Node)]
+           removeOverlap _    []         = []
+           removeOverlap minX ((i,n):ns) =
+                 (i, n { nodeX = newNodeX })
+               : removeOverlap (newNodeX + nodeWidth n + paddingX) ns
+             where
+               newNodeX :: Int
+               newNodeX
+                 | nodeX n >= minX = nodeX n
+                 | otherwise       = minX
+
+           -- Find a previously constructed node
+           prevNode :: Int -> Node
+           prevNode i = IMap.findWithDefault
+                          (error $ "node: unknown node " ++ show i)
+                          i
+                          acc
+
+    -- Translate imports to reverse imports ("imported by")
+    invertEdges :: Edges -> Edges
+    invertEdges =
+          IMap.unionsWith ISet.union
+        . concatMap (\(b, as) -> map (\a -> IMap.singleton a (ISet.singleton b)) as)
+        . map (second ISet.toList)
+        . IMap.toList
+
+    invertTrie :: [String] -> Nodes -> IMap.IntMap String
+    invertTrie acc (Trie.Sub ts mb) =
+          maybe id (repeatedly insert) mb
+        . IMap.unions
+        . map (\(a, ts') -> invertTrie (a:acc) ts')
+        $ Map.toList ts
+      where
+        insert :: ((NodeT, String), Int)
+               -> IMap.IntMap String
+               -> IMap.IntMap String
+        insert ((ModuleNode, m), i) = IMap.insert i (moduleName  (m:acc))
+        insert other = error $ "insert: unsupported node " ++ show other
+
+        moduleName :: [String] -> String
+        moduleName = intercalate "." . reverse
+
+repeatedly :: (a -> b -> b) -> ([a] -> b -> b)
+repeatedly = flip . foldl' . flip
+
+
+{-
+data NodeT    = ModuleNode
+
+              | ModuleInItsCluster
+                -- ^ A module that has been relocated to its cluster
+
+              | Redirect
+                -- ^ This is not rendered. It is there to support replacing
+                -- one node with another (e.g., when collapsing)
+
+              | Deleted
+                -- ^ This is not rendered, and edges to/from it are also
+                -- not rendered.
+
+              | CollapsedNode Bool
+                -- ^ indicates if it contains module too.
+                deriving (Show,Eq,Ord)
+-}
