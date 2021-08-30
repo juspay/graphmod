@@ -651,16 +651,24 @@ make_dag :: Opts -> (AllEdges, Nodes) -> String
 make_dag _opts = \(edges, nodes) ->
     if not (IMap.null (sourceEdges edges))
       then error "Not, in fact, a tree"
-      else let nodes'     = invertTrie [] nodes
+      else let nodes' :: IMap.IntMap String
+               nodes' = invertTrie [] nodes
+
+               imports, revImports :: Edges
                imports    = normalEdges edges
                revImports = invertEdges imports
-           in   html
-              . genJS imports revImports
-              . mkDAG nodes' imports
-              $ layers imports ISet.empty (IMap.keysSet nodes')
+
+               dag :: DAG
+               dag = mkDAG nodes' imports $
+                       layers imports ISet.empty (IMap.keysSet nodes')
+
+
+           in html
+                (genJS imports revImports dag)
+                (genSelect dag)
   where
-    html :: String -> String
-    html script = intercalate "\n" [
+    html :: String -> String -> String
+    html script select = intercalate "\n" [
           "<!DOCTYPE html>"
         , "<html>"
         , " <head>"
@@ -670,6 +678,9 @@ make_dag _opts = \(edges, nodes) ->
         , "  </script>"
         , " </head>"
         , " <body onload=\"init();\">"
+        , "   <select onChange=\"selectNode(allNodes[this.value]);\">"
+        , select
+        , "   </select>"
         , "   <canvas id=\"canvas\" width=\"20000\" height=\"5000\"></canvas>"
         , " </body>"
         , "</html>"
@@ -686,6 +697,12 @@ make_dag _opts = \(edges, nodes) ->
     initX, initY :: Int
     initX = 10;
     initY = 10;
+
+    genSelect :: DAG -> String
+    genSelect dag = intercalate "\n" [
+          "<option value=\"" ++ show ix ++ "\">" ++ nodeLabel n ++ "</option>"
+        | (ix, n) <- sortBy (comparing (nodeLabel . snd)) $ IMap.toList dag
+        ]
 
     genJS :: Edges -> Edges -> DAG -> String
     genJS imports revImports dag = intercalate "\n" [
@@ -722,10 +739,14 @@ make_dag _opts = \(edges, nodes) ->
         , "    if(x >= n.x && x <= (n.x + n.width) &&"
         , "       y >= n.y && y <= (n.y + n.height)) {"
         , "      console.log('Clicked on ', n.label);"
-        , "      selectedNode = n;"
-        , "      draw();"
+        , "      selectNode(n);"
         , "    }"
         , "  }"
+        , "}"
+        , ""
+        , "function selectNode(n) {"
+        , "  selectedNode = n;"
+        , "  draw();"
         , "}"
         , ""
         , "function drawNode(ctx, i) {"
